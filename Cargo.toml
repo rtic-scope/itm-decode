@@ -1,12 +1,12 @@
 [package]
 name = "itm-decode"
-version = "0.3.2"
+version = "0.3.3"
 authors = [
         "Viktor Sonesten <v@tmplt.dev>",
 ]
 edition = "2018"
 readme = "README.md"
-repository = "https://github.com/tmplt/itm-decode"
+repository = "https://github.com/tmplt/itm-decode/tree/0.3-bump-deps"
 license = "MIT OR Apache-2.0"
 description = "A sans-I/O library for decoding ITM and DWT packets"
 homepage = "https://github.com/tmplt/itm-decode"
@@ -15,8 +15,7 @@ homepage = "https://github.com/tmplt/itm-decode"
 
 [dependencies]
 bitmatch = "0.1.1"
-bitvec = "0.19.4"
-funty = "=1.1.0"
+bitvec = "0.22"
 
 # only required by itm-decode executable
 anyhow = { version = "1.0", optional = true }
