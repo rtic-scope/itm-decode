@@ -11,10 +11,11 @@
 //! - MSB: most significant bit;
 //! - BE: big-endian;
 
+use std::convert::TryInto;
+use std::io::Read;
+
 use bitmatch::bitmatch;
 use bitvec::prelude::*;
-use std::convert::TryInto;
-
 #[cfg(feature = "serde")]
 use serde_crate::{Deserialize, Serialize};
 
@@ -484,34 +485,6 @@ impl Default for TimestampedContext {
     }
 }
 
-pub struct DecoderOptions {
-    /// Whether to only process global timestamps in the bitstream on
-    /// [Decoder::pull_with_timestamps].
-    pub only_gts: bool,
-}
-
-impl Default for DecoderOptions {
-    fn default() -> Self {
-        Self { only_gts: false }
-    }
-}
-
-/// ITM and DWT packet protocol decoder.
-pub struct Decoder {
-    /// Decoder options
-    options: DecoderOptions,
-
-    /// The incoming bytes to the decoder.
-    incoming: BitVec,
-
-    /// Whether the decoder is in a state of synchronization.
-    sync: Option<usize>,
-
-    /// Timestamp context. Used exclusively in
-    /// [Decoder::pull_with_timestamp] for bookkeeping purposes.
-    ts_ctx: TimestampedContext,
-}
-
 /// Association between a set of [TracePacket]s and their Timestamp.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(
@@ -534,14 +507,68 @@ enum HeaderVariant {
     Stub(PacketStub),
 }
 
-impl Decoder {
-    pub fn new(options: DecoderOptions) -> Self {
+pub struct DecoderOptions {
+    /// Whether to only process global timestamps in the bitstream on
+    /// [Decoder::pull_with_timestamps].
+    pub only_gts: bool,
+
+    /// Whether to keep reading after a (temporary) EOF condition.
+    pub keep_reading: bool,
+}
+
+impl Default for DecoderOptions {
+    fn default() -> Self {
+        Self {
+            only_gts: false,
+            keep_reading: true,
+        }
+    }
+}
+
+/// ITM/DWT packet protocol decoder.
+pub struct Decoder<R>
+where
+    R: Read,
+{
+    /// Decoder options.
+    options: DecoderOptions,
+
+    /// Intermediate buffer to store the trace byte stream read from [reader].
+    buffer: BitVec,
+
+    /// Source from which to read the trace byte stream.
+    reader: R,
+
+    /// Whether the decoder is in a state of synchronization.
+    sync: Option<usize>,
+
+    /// Timestamp context. Used exclusively in
+    /// [Decoder::pull_with_timestamp] for bookkeeping purposes.
+    ts_ctx: TimestampedContext,
+}
+
+impl<R> Decoder<R>
+where
+    R: Read,
+{
+    pub fn new(reader: R, options: DecoderOptions) -> Decoder<R> {
         Decoder {
             options,
-            incoming: BitVec::new(),
+            buffer: BitVec::new(),
+            reader,
             sync: None,
             ts_ctx: TimestampedContext::default(),
         }
+    }
+
+    /// Gets a reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// Gets a mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
     }
 
     /// Push trace data into the decoder.
@@ -551,27 +578,58 @@ impl Decoder {
         // but is better done here than elsewhere.
         let mut bv = BitVec::<LocalBits, _>::from_vec(data.to_vec());
         bv.reverse();
-        bv.append(&mut self.incoming);
-        self.incoming.append(&mut bv);
+        bv.append(&mut self.buffer);
+        self.buffer.append(&mut bv);
+    }
+
+    /// Reads a byte from [Self::reader] into the buffer
+    fn buffer_byte(&mut self) -> std::io::Result<usize> {
+        todo!();
     }
 
     /// Decode the next [TracePacket].
-    pub fn pull(&mut self) -> Result<Option<TracePacket>, MalformedPacket> {
+    pub fn next(&mut self) -> Result<Option<TracePacket>, MalformedPacket> {
         if self.sync.is_some() {
             return self.handle_sync();
         }
         assert!(self.sync.is_none());
 
-        if self.incoming.len() < 8 {
+        if self.buffer.len() < 8 {
+            // TODO read from reader until we have at least one byte?
+
             // No header to decode, nothing to do
+            // TODO return any transient bytes as an error (if keep_reading == false)
             return Ok(None);
         }
 
         self.ts_ctx.packets_consumed += 1;
-        match Self::decode_header(self.pull_byte())? {
+        match decode_header(self.pull_byte())? {
             HeaderVariant::Packet(p) => Ok(Some(p)),
             HeaderVariant::Stub(s) => self.process_stub(&s),
         }
+    }
+
+    /// Read zeros from the bitstream until the first bit is set. This
+    /// realigns the incoming bitstream for further processing, which
+    /// may not be 8-bit aligned.
+    fn handle_sync(&mut self) -> Result<Option<TracePacket>, MalformedPacket> {
+        if let Some(mut count) = self.sync {
+            while let Some(bit) = self.buffer.pop() {
+                if !bit && count < SYNC_MIN_ZEROS {
+                    count += 1;
+                    continue;
+                } else if bit && count >= SYNC_MIN_ZEROS {
+                    self.sync = None;
+                    return Ok(Some(TracePacket::Sync));
+                } else {
+                    self.sync = None;
+                    return Err(MalformedPacket::InvalidSync(count));
+                }
+            }
+        }
+
+        // Ok(None)
+        unreachable!();
     }
 
     /// Pull the next set of ITM data packets (not timestamps) from the
@@ -615,7 +673,7 @@ impl Decoder {
         }
 
         loop {
-            match self.pull() {
+            match self.next() {
                 // No packets remaining
                 Ok(None) => return None,
 
@@ -703,33 +761,11 @@ impl Decoder {
         }
     }
 
-    /// Read zeros from the bitstream until the first bit is set. This
-    /// realigns the incoming bitstream for further processing, which
-    /// may not be 8-bit aligned.
-    fn handle_sync(&mut self) -> Result<Option<TracePacket>, MalformedPacket> {
-        if let Some(mut count) = self.sync {
-            while let Some(bit) = self.incoming.pop() {
-                if !bit && count < SYNC_MIN_ZEROS {
-                    count += 1;
-                    continue;
-                } else if bit && count >= SYNC_MIN_ZEROS {
-                    self.sync = None;
-                    return Ok(Some(TracePacket::Sync));
-                } else {
-                    self.sync = None;
-                    return Err(MalformedPacket::InvalidSync(count));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
     /// Pulls a single byte from the incoming buffer.
     fn pull_byte(&mut self) -> u8 {
         let mut b: u8 = 0;
         for i in 0..8 {
-            b |= (self.incoming.pop().unwrap() as u8) << i;
+            b |= (self.buffer.pop().unwrap() as u8) << i;
         }
 
         b
@@ -738,7 +774,7 @@ impl Decoder {
     /// Pulls `cnt` bytes from the incoming buffer, if `cnt` bytes are
     /// available.
     fn pull_bytes(&mut self, cnt: usize) -> Option<Vec<u8>> {
-        if self.incoming.len() < cnt * 8 {
+        if self.buffer.len() < cnt * 8 {
             return None;
         }
 
@@ -753,7 +789,7 @@ impl Decoder {
     /// is not set. All [PacketStub]s follow follow this payload schema.
     /// (e.g. Appendix D4, Fig. D4-4)
     fn pull_payload(&mut self) -> Option<Vec<u8>> {
-        let mut iter = self.incoming.rchunks(8);
+        let mut iter = self.buffer.rchunks(8);
         let mut cnt = 0;
         loop {
             cnt += 1;
@@ -786,7 +822,7 @@ impl Decoder {
                 expected_size,
             } => {
                 if let Some(payload) = self.pull_bytes(*expected_size) {
-                    Self::handle_hardware_source(*disc_id, payload).map(Some)
+                    handle_hardware_source(*disc_id, payload).map(Some)
                 } else {
                     Ok(None)
                 }
@@ -795,7 +831,7 @@ impl Decoder {
                 if let Some(payload) = self.pull_payload() {
                     Ok(Some(TracePacket::LocalTimestamp1 {
                         data_relation: data_relation.clone(),
-                        ts: Decoder::extract_timestamp(payload, 27),
+                        ts: extract_timestamp(payload, 27),
                     }))
                 } else {
                     Ok(None)
@@ -804,7 +840,7 @@ impl Decoder {
             PacketStub::GlobalTimestamp1 => {
                 if let Some(payload) = self.pull_payload() {
                     Ok(Some(TracePacket::GlobalTimestamp1 {
-                        ts: Decoder::extract_timestamp(payload.clone(), 25),
+                        ts: extract_timestamp(payload.clone(), 25),
                         clkch: (payload.last().unwrap() & (1 << 5)) >> 5 == 1,
                         wrap: (payload.last().unwrap() & (1 << 6)) >> 6 == 1,
                     }))
@@ -815,7 +851,7 @@ impl Decoder {
             PacketStub::GlobalTimestamp2 => {
                 if let Some(payload) = self.pull_payload() {
                     Ok(Some(TracePacket::GlobalTimestamp2 {
-                        ts: Decoder::extract_timestamp(
+                        ts: extract_timestamp(
                             payload.to_vec(),
                             match payload.len() {
                                 4 => 47 - 26, // 48 bit timestamp
@@ -847,230 +883,226 @@ impl Decoder {
             }
         }
     }
+}
 
-    // TODO template this for u32, u64?
-    fn extract_timestamp(payload: Vec<u8>, max_len: u64) -> u64 {
-        // Decode the first N - 1 payload bytes
-        let (rtail, head) = payload.split_at(payload.len() - 1);
-        let mut ts: u64 = 0;
-        for (i, b) in rtail.iter().enumerate() {
-            ts |= ((b & !(1 << 7)) as u64) // mask out continuation bit
-                << (7 * i);
-        }
-
-        // Mask out the timestamp's MSBs and shift them into the final
-        // value.
-        let shift = 7 - (max_len % 7);
-        let mask: u8 = 0xFFu8.wrapping_shl(shift.try_into().unwrap()) >> shift;
-        ts | (((head[0] & mask) as u64) << (7 * rtail.len()))
+// TODO template this for u32, u64?
+fn extract_timestamp(payload: Vec<u8>, max_len: u64) -> u64 {
+    // Decode the first N - 1 payload bytes
+    let (rtail, head) = payload.split_at(payload.len() - 1);
+    let mut ts: u64 = 0;
+    for (i, b) in rtail.iter().enumerate() {
+        ts |= ((b & !(1 << 7)) as u64) // mask out continuation bit
+            << (7 * i);
     }
 
-    /// Decodes the payload of a hardware source packet.
+    // Mask out the timestamp's MSBs and shift them into the final
+    // value.
+    let shift = 7 - (max_len % 7);
+    let mask: u8 = 0xFFu8.wrapping_shl(shift.try_into().unwrap()) >> shift;
+    ts | (((head[0] & mask) as u64) << (7 * rtail.len()))
+}
+
+/// Decodes the first byte of a packet, the header, into a complete packet or a packet stub.
+#[allow(clippy::bad_bit_mask)]
+#[bitmatch]
+fn decode_header(header: u8) -> Result<HeaderVariant, MalformedPacket> {
+    fn translate_ss(ss: u8) -> Option<usize> {
+        // See (Appendix D4.2.8, Table D4-4)
+        Some(
+            match ss {
+                0b01 => 2,
+                0b10 => 3,
+                0b11 => 5,
+                _ => return None,
+            } - 1, // ss would include the header byte, but it has already been processed
+        )
+    }
+
+    let stub = |s| Ok(HeaderVariant::Stub(s));
+    let packet = |p| Ok(HeaderVariant::Packet(p));
+
     #[bitmatch]
-    fn handle_hardware_source(
-        disc_id: u8,
-        payload: Vec<u8>,
-    ) -> Result<TracePacket, MalformedPacket> {
-        match disc_id {
-            0 => {
-                // event counter wrap
+    match header {
+        // Synchronization packet category
+        "0000_0000" => stub(PacketStub::Sync(8)),
 
-                if payload.len() != 1 {
-                    return Err(MalformedPacket::InvalidHardwarePacket { disc_id, payload });
-                }
+        // Protocol packet category
+        "0111_0000" => packet(TracePacket::Overflow),
+        "11rr_0000" => {
+            // Local timestamp, format 1 (LTS1)
+            let tc = r; // relationship with corresponding data
 
-                let b = payload[0];
-                Ok(TracePacket::EventCounterWrap {
-                    cyc: b & (1 << 5) != 0,
-                    fold: b & (1 << 4) != 0,
-                    lsu: b & (1 << 3) != 0,
-                    sleep: b & (1 << 2) != 0,
-                    exc: b & (1 << 1) != 0,
-                    cpi: b & (1 << 0) != 0,
-                })
+            stub(PacketStub::LocalTimestamp {
+                data_relation: match tc {
+                    0b00 => TimestampDataRelation::Sync,
+                    0b01 => TimestampDataRelation::UnknownDelay,
+                    0b10 => TimestampDataRelation::AssocEventDelay,
+                    0b11 => TimestampDataRelation::UnknownAssocEventDelay,
+                    _ => unreachable!(),
+                },
+            })
+        }
+        "0ttt_0000" => {
+            // Local timestamp, format 2 (LTS2)
+            packet(TracePacket::LocalTimestamp2 { ts: t })
+        }
+        "1001_0100" => {
+            // Global timestamp, format 1 (GTS1)
+            stub(PacketStub::GlobalTimestamp1)
+        }
+        "1011_0100" => {
+            // Global timestamp, format 2(GTS2)
+            stub(PacketStub::GlobalTimestamp2)
+        }
+        "0ppp_1000" => {
+            // Extension packet
+            packet(TracePacket::Extension { page: p })
+        }
+
+        // Source packet category
+        "aaaa_a0ss" => {
+            // Instrumentation packet
+            stub(PacketStub::Instrumentation {
+                port: a,
+                expected_size: if let Some(s) = translate_ss(s) {
+                    s
+                } else {
+                    return Err(MalformedPacket::InvalidSourcePayload { header, size: s });
+                },
+            })
+        }
+        "aaaa_a1ss" => {
+            // Hardware source packet
+            let disc_id = a;
+
+            if !(0..=2).contains(&disc_id) && !(8..=23).contains(&disc_id) {
+                return Err(MalformedPacket::InvalidHardwareDisc {
+                    disc_id,
+                    size: s.into(),
+                });
             }
-            1 => {
-                // exception trace
 
-                if payload.len() != 2 {
-                    return Err(MalformedPacket::InvalidHardwarePacket { disc_id, payload });
-                }
+            stub(PacketStub::HardwareSource {
+                disc_id,
+                expected_size: if let Some(s) = translate_ss(s) {
+                    s
+                } else {
+                    return Err(MalformedPacket::InvalidSourcePayload { header, size: s });
+                },
+            })
+        }
+        "hhhh_hhhh" => Err(MalformedPacket::InvalidHeader(h)),
+    }
+}
 
-                let function = (payload[1] >> 4) & 0b11;
-                let exception_number = ((payload[1] as u16 & 1) << 8) | payload[0] as u16;
-                let exception_number: u8 = if let Ok(nr) = exception_number.try_into() {
-                    nr
+/// Decodes the payload of a hardware source packet.
+#[bitmatch]
+fn handle_hardware_source(disc_id: u8, payload: Vec<u8>) -> Result<TracePacket, MalformedPacket> {
+    match disc_id {
+        0 => {
+            // event counter wrap
+
+            if payload.len() != 1 {
+                return Err(MalformedPacket::InvalidHardwarePacket { disc_id, payload });
+            }
+
+            let b = payload[0];
+            Ok(TracePacket::EventCounterWrap {
+                cyc: b & (1 << 5) != 0,
+                fold: b & (1 << 4) != 0,
+                lsu: b & (1 << 3) != 0,
+                sleep: b & (1 << 2) != 0,
+                exc: b & (1 << 1) != 0,
+                cpi: b & (1 << 0) != 0,
+            })
+        }
+        1 => {
+            // exception trace
+
+            if payload.len() != 2 {
+                return Err(MalformedPacket::InvalidHardwarePacket { disc_id, payload });
+            }
+
+            let function = (payload[1] >> 4) & 0b11;
+            let exception_number = ((payload[1] as u16 & 1) << 8) | payload[0] as u16;
+            let exception_number: u8 = if let Ok(nr) = exception_number.try_into() {
+                nr
+            } else {
+                return Err(MalformedPacket::InvalidExceptionTrace {
+                    exception: exception_number,
+                    function,
+                });
+            };
+
+            Ok(TracePacket::ExceptionTrace {
+                exception: if let Some(exception) = cortex_m::VectActive::from(exception_number) {
+                    exception
                 } else {
                     return Err(MalformedPacket::InvalidExceptionTrace {
-                        exception: exception_number,
+                        exception: exception_number.into(),
                         function,
                     });
-                };
-
-                Ok(TracePacket::ExceptionTrace {
-                    exception: if let Some(exception) = cortex_m::VectActive::from(exception_number)
-                    {
-                        exception
-                    } else {
+                },
+                action: match function {
+                    0b01 => ExceptionAction::Entered,
+                    0b10 => ExceptionAction::Exited,
+                    0b11 => ExceptionAction::Returned,
+                    _ => {
                         return Err(MalformedPacket::InvalidExceptionTrace {
                             exception: exception_number.into(),
                             function,
-                        });
-                    },
-                    action: match function {
-                        0b01 => ExceptionAction::Entered,
-                        0b10 => ExceptionAction::Exited,
-                        0b11 => ExceptionAction::Returned,
-                        _ => {
-                            return Err(MalformedPacket::InvalidExceptionTrace {
-                                exception: exception_number.into(),
-                                function,
-                            })
-                        }
-                    },
-                })
-            }
-            2 => {
-                // PC sample
-                match payload.len() {
-                    1 if payload[0] == 0 => Ok(TracePacket::PCSample { pc: None }),
-                    4 => Ok(TracePacket::PCSample {
-                        pc: Some(u32::from_le_bytes(payload.try_into().unwrap())),
-                    }),
-                    _ => Err(MalformedPacket::InvalidPCSampleSize { payload }),
-                }
-            }
-            8..=23 => {
-                // data trace
-                #[bitmatch]
-                let "???t_tccd" = disc_id; // we have already masked out bit[2:0]
-                let comparator = c;
-
-                match (t, d, payload.len()) {
-                    (0b01, 0, 4) => {
-                        // PC value packet
-                        Ok(TracePacket::DataTracePC {
-                            comparator,
-                            pc: u32::from_le_bytes(payload.try_into().unwrap()),
                         })
                     }
-                    (0b01, 1, 2) => {
-                        // address packet
-                        Ok(TracePacket::DataTraceAddress {
-                            comparator,
-                            data: payload,
-                        })
-                    }
-                    (0b10, d, _) => {
-                        // data value packet
-                        Ok(TracePacket::DataTraceValue {
-                            comparator,
-                            access_type: if d == 0 {
-                                MemoryAccessType::Read
-                            } else {
-                                MemoryAccessType::Write
-                            },
-                            value: payload,
-                        })
-                    }
-                    _ => Err(MalformedPacket::InvalidHardwarePacket { disc_id, payload }),
+                },
+            })
+        }
+        2 => {
+            // PC sample
+            match payload.len() {
+                1 if payload[0] == 0 => Ok(TracePacket::PCSample { pc: None }),
+                4 => Ok(TracePacket::PCSample {
+                    pc: Some(u32::from_le_bytes(payload.try_into().unwrap())),
+                }),
+                _ => Err(MalformedPacket::InvalidPCSampleSize { payload }),
+            }
+        }
+        8..=23 => {
+            // data trace
+            #[bitmatch]
+            let "???t_tccd" = disc_id; // we have already masked out bit[2:0]
+            let comparator = c;
+
+            match (t, d, payload.len()) {
+                (0b01, 0, 4) => {
+                    // PC value packet
+                    Ok(TracePacket::DataTracePC {
+                        comparator,
+                        pc: u32::from_le_bytes(payload.try_into().unwrap()),
+                    })
                 }
-            }
-            _ => unreachable!(), // we already verify the discriminator when we decode the header
-        }
-    }
-
-    /// Decodes the first byte of a packet, the header, into a complete packet or a packet stub.
-    #[allow(clippy::bad_bit_mask)]
-    #[bitmatch]
-    fn decode_header(header: u8) -> Result<HeaderVariant, MalformedPacket> {
-        fn translate_ss(ss: u8) -> Option<usize> {
-            // See (Appendix D4.2.8, Table D4-4)
-            Some(
-                match ss {
-                    0b01 => 2,
-                    0b10 => 3,
-                    0b11 => 5,
-                    _ => return None,
-                } - 1, // ss would include the header byte, but it has already been processed
-            )
-        }
-
-        let stub = |s| Ok(HeaderVariant::Stub(s));
-        let packet = |p| Ok(HeaderVariant::Packet(p));
-
-        #[bitmatch]
-        match header {
-            // Synchronization packet category
-            "0000_0000" => stub(PacketStub::Sync(8)),
-
-            // Protocol packet category
-            "0111_0000" => packet(TracePacket::Overflow),
-            "11rr_0000" => {
-                // Local timestamp, format 1 (LTS1)
-                let tc = r; // relationship with corresponding data
-
-                stub(PacketStub::LocalTimestamp {
-                    data_relation: match tc {
-                        0b00 => TimestampDataRelation::Sync,
-                        0b01 => TimestampDataRelation::UnknownDelay,
-                        0b10 => TimestampDataRelation::AssocEventDelay,
-                        0b11 => TimestampDataRelation::UnknownAssocEventDelay,
-                        _ => unreachable!(),
-                    },
-                })
-            }
-            "0ttt_0000" => {
-                // Local timestamp, format 2 (LTS2)
-                packet(TracePacket::LocalTimestamp2 { ts: t })
-            }
-            "1001_0100" => {
-                // Global timestamp, format 1 (GTS1)
-                stub(PacketStub::GlobalTimestamp1)
-            }
-            "1011_0100" => {
-                // Global timestamp, format 2(GTS2)
-                stub(PacketStub::GlobalTimestamp2)
-            }
-            "0ppp_1000" => {
-                // Extension packet
-                packet(TracePacket::Extension { page: p })
-            }
-
-            // Source packet category
-            "aaaa_a0ss" => {
-                // Instrumentation packet
-                stub(PacketStub::Instrumentation {
-                    port: a,
-                    expected_size: if let Some(s) = translate_ss(s) {
-                        s
-                    } else {
-                        return Err(MalformedPacket::InvalidSourcePayload { header, size: s });
-                    },
-                })
-            }
-            "aaaa_a1ss" => {
-                // Hardware source packet
-                let disc_id = a;
-
-                if !(0..=2).contains(&disc_id) && !(8..=23).contains(&disc_id) {
-                    return Err(MalformedPacket::InvalidHardwareDisc {
-                        disc_id,
-                        size: s.into(),
-                    });
+                (0b01, 1, 2) => {
+                    // address packet
+                    Ok(TracePacket::DataTraceAddress {
+                        comparator,
+                        data: payload,
+                    })
                 }
-
-                stub(PacketStub::HardwareSource {
-                    disc_id,
-                    expected_size: if let Some(s) = translate_ss(s) {
-                        s
-                    } else {
-                        return Err(MalformedPacket::InvalidSourcePayload { header, size: s });
-                    },
-                })
+                (0b10, d, _) => {
+                    // data value packet
+                    Ok(TracePacket::DataTraceValue {
+                        comparator,
+                        access_type: if d == 0 {
+                            MemoryAccessType::Read
+                        } else {
+                            MemoryAccessType::Write
+                        },
+                        value: payload,
+                    })
+                }
+                _ => Err(MalformedPacket::InvalidHardwarePacket { disc_id, payload }),
             }
-            "hhhh_hhhh" => Err(MalformedPacket::InvalidHeader(h)),
         }
+        _ => unreachable!(), // we already verify the discriminator when we decode the header
     }
 }
 
@@ -1105,7 +1137,7 @@ mod tests {
             0b0000_0000,
         ].to_vec();
 
-        assert_eq!(Decoder::extract_timestamp(ts, 25), 0);
+        assert_eq!(extract_timestamp(ts, 25), 0);
 
         #[rustfmt::skip]
         let ts: Vec<u8> = [
@@ -1115,10 +1147,7 @@ mod tests {
             0b0111_1111
         ].to_vec();
 
-        assert_eq!(
-            Decoder::extract_timestamp(ts, 27),
-            0b1111111_0011111_0000111_0000001,
-        );
+        assert_eq!(extract_timestamp(ts, 27), 0b1111111_0011111_0000111_0000001,);
 
         #[rustfmt::skip]
         let ts: Vec<u8> = [
@@ -1128,9 +1157,6 @@ mod tests {
             0b1111_1111
         ].to_vec();
 
-        assert_eq!(
-            Decoder::extract_timestamp(ts, 25),
-            0b11111_0011111_0000111_0000001,
-        );
+        assert_eq!(extract_timestamp(ts, 25), 0b11111_0011111_0000111_0000001,);
     }
 }

@@ -44,7 +44,7 @@ fn main() -> Result<()> {
         _ => Box::new(BufReader::new(io::stdin())),
     };
 
-    let mut decoder = Decoder::new(DecoderOptions::default());
+    let mut decoder: Decoder<std::fs::File> = todo!(); //Decoder::new(DecoderOptions::default());
     let mut stim = if opt.instr_as_string {
         Some(BTreeMap::new())
     } else {
@@ -52,7 +52,7 @@ fn main() -> Result<()> {
     };
 
     loop {
-        match decoder.pull() {
+        match decoder.next() {
             Ok(None) => {
                 let mut buf = [0_u8; 8];
                 if file
